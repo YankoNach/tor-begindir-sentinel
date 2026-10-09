@@ -8,11 +8,17 @@ The Sentinel watches Tor's MetricsPort and Linux `/proc`, records normal relay b
 
 ## Why this exists
 
-During October 2026, several relay observations showed short-lived but severe waves of abnormal `BEGIN_DIR` activity. In affected periods, relays could show hundreds or thousands of `BEGIN_DIR` requests per second, highly asymmetric traffic, and heavy Tor main-thread CPU load. The phenomenon could then stop abruptly without a Tor restart.
+Reports of this phenomenon were already being discussed by Tor relay operators in early September 2026, and at least one operator later reported seeing similar behaviour for weeks before that.
 
-The Sentinel was built to capture those transitions with enough resolution to make later analysis useful.
+The most obvious operator-visible symptom was often **sudden, extreme traffic asymmetry** on a relay whose traffic was normally much more balanced. In the original September discussion, operators described cases with outbound traffic many times higher than inbound traffic, or the reverse. Some also reported that setting `DirCache 0` during an event appeared to reverse the dominant traffic direction. That behaviour has been reported by others, but has **not yet been reproduced in a controlled Sentinel capture**.
 
-The project deliberately uses the neutral term **BEGIN_DIR storm**. A high `BEGIN_DIR` rate is an observable condition; this tool does not attempt to determine intent or attribute the cause.
+A key clue came from Tor MetricsPort data: one relay operator reported roughly 70,000 `BEGIN_DIR` streams in one minute during an event, versus about 300 in a normal minute. In later independent observations on other relays, `BEGIN_DIR` rates again rose from a low baseline to hundreds or thousands per second while traffic became strongly asymmetric and Tor CPU load increased.
+
+That makes `BEGIN_DIR` a particularly useful **early and specific observable indicator** of the phenomenon, even though correlation alone does not prove that `BEGIN_DIR` is the root cause.
+
+The Sentinel was built to capture these transitions with enough temporal resolution to correlate `BEGIN_DIR`, traffic direction, CPU load, circuits, sockets, and relay flags before, during, and after an event.
+
+The project deliberately uses the neutral term **BEGIN_DIR storm**. It does not assume malicious intent, identify an attacker, or attribute the underlying cause.
 
 ## What it records
 
