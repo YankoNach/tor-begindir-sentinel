@@ -20,6 +20,23 @@ The Sentinel was built to capture these transitions with enough temporal resolut
 
 The project deliberately uses the neutral term **BEGIN_DIR storm**. It does not assume malicious intent, identify an attacker, or attribute the underlying cause.
 
+## Example observed event
+
+Before the Sentinel was written, an earlier 5-minute-interval monitor captured a useful transition on one relay on 2026-10-08. The same Tor process remained running throughout.
+
+| UTC time | BEGIN_DIR/s | Read MB/s | Write MB/s | Write/read | Open circuits |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 22:17:54 | 687.73 | 1.243 | 4.058 | 3.26 | 7018 |
+| 22:22:54 | 699.89 | 1.169 | 4.021 | 3.44 | 6984 |
+| 22:27:54 | 764.49 | 1.257 | 4.009 | 3.19 | 7181 |
+| 22:32:54 | 164.60 | 0.544 | 4.019 | 7.39 | 2604 |
+| 22:37:54 | 1.17 | 3.545 | 3.912 | 1.10 | 3151 |
+| 22:42:54 | 1.05 | 4.088 | 4.119 | 1.01 | 3928 |
+
+The 22:32 sample spans the transition, so it is a mixed five-minute average rather than the exact stop time. By the next interval, `BEGIN_DIR` had fallen from hundreds per second to about 1/s and traffic had become almost symmetric again, without a Tor restart or PID change.
+
+This abrupt transition is one of the reasons the Sentinel uses much shorter sampling intervals: 30 seconds normally and 10 seconds while suspicious activity is present.
+
 ## What it records
 
 By default the Sentinel records:
