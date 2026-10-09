@@ -118,10 +118,12 @@ The monitor uses only the Python standard library.
 
 ## Tor configuration
 
-A local MetricsPort is required. For example:
+A local MetricsPort is required and localhost must be allowed by the MetricsPort policy. For example:
 
 ```text
+# Monitor port
 MetricsPort 127.0.0.1:9035
+MetricsPortPolicy accept 127.0.0.1
 ```
 
 Check your Tor configuration before reloading it.
