@@ -42,6 +42,7 @@ relay has a significantly different normal BEGIN_DIR baseline.
 import csv
 import gzip
 import json
+import math
 import os
 import re
 import shutil
@@ -144,6 +145,9 @@ def parse_metrics(text):
         try:
             value = float(parts[1])
         except ValueError:
+            continue
+        # Non-finite values must not masquerade as valid counters/gauges.
+        if not math.isfinite(value):
             continue
 
         if "{" in identity:
@@ -566,6 +570,8 @@ def fetch_snapshot():
         ) from exc
     if completed.returncode != 0:
         error = (completed.stderr or "").strip()[-350:]
+        if error.startswith(("TimeoutError:", "socket.timeout:")):
+            raise TimeoutError(f"MetricsPort child timed out: {error}")
         raise RuntimeError(
             f"MetricsPort child failed exit={completed.returncode}: {error}"
         )
