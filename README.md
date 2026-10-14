@@ -4,9 +4,9 @@ This repository provides **two complementary, passive monitoring tools for Tor r
 
 **Tor BEGIN_DIR Storm Sentinel** polls Tor's local MetricsPort to detect unusual `BEGIN_DIR` activity, capture detailed Tor counters and relay flags, and switch to faster sampling when suspicious activity appears. **Linux OS Sentinel** independently samples Linux `/proc` and `/sys` to record host and Tor-process CPU, memory, system pressure and network-interface traffic, even when Tor's MetricsPort is slow or unresponsive. An optional background MetricsPort latency probe does not block its Linux measurements. Neither tool changes, controls or restarts Tor.
 
-> **Experimental monitoring tool.** This project is not affiliated with or endorsed by the Tor Project. It does **not** mitigate, block, throttle, reload, restart, or otherwise modify Tor.
+> **Experimental monitoring tools.** This project is not affiliated with or endorsed by the Tor Project. Neither monitor mitigates, blocks, throttles, reloads, restarts, or otherwise modifies Tor.
 
-## Two complementary, passive monitors
+## Quick comparison
 
 | Tool | Primary purpose | Works without a responsive Tor MetricsPort? |
 | --- | --- | --- |
