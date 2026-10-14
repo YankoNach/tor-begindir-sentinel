@@ -1,0 +1,24 @@
+name: Sentinel Python checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Compile scripts
+        run: |
+          python3 -m py_compile tor-begindir-sentinel.py
+          if test -f linux-os-sentinel.py; then
+            python3 -m py_compile linux-os-sentinel.py
+          fi
+      - name: Run offline unit tests
+        run: python3 -m unittest discover -s tests -v
