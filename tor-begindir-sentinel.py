@@ -656,10 +656,20 @@ def main():
             else None
         )
         if previous_process is not None and current_process != previous_process:
-            event(
-                f"TOR_PROCESS_CHANGE old={previous_process} "
-                f"new={current_process}"
-            )
+            if current_process is None:
+                event(f"TOR_PROCESS_MISSING old={previous_process}")
+            elif previous_process[0] != current_process[0]:
+                # Keep the original event name for downstream consumers.
+                event(
+                    f"TOR_PID_CHANGE old={previous_process[0]} "
+                    f"new={current_process[0]}"
+                )
+            else:
+                event(
+                    f"TOR_PROCESS_RESTART pid={pid} "
+                    f"old_start={previous_process[1]} "
+                    f"new_start={proc_start_ticks}"
+                )
             previous = None
             previous_monotonic = None
 
