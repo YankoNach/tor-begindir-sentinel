@@ -181,6 +181,22 @@ class ScrapeDeadlineTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_socket_timeout_reported_by_child_keeps_timeout_status(self):
+        failed = subprocess.CompletedProcess(
+            args=["python"], returncode=2, stdout="",
+            stderr="TimeoutError: timed out"
+        )
+        with patch.object(monitor.subprocess, "run", return_value=failed):
+            with self.assertRaises(TimeoutError):
+                monitor.fetch_snapshot()
+
+    def test_nonfinite_metrics_are_not_valid_samples(self):
+        raw = 'tor_relay_streams_total{type="BEGIN_DIR"} NaN\\n'
+        self.assertIsNone(
+            monitor.metric_value(monitor.parse_metrics(raw), "relay_streams_total",
+                                 {"type": "BEGIN_DIR"})
+        )
+
     def test_worker_failure_propagates_as_error(self):
         failed = subprocess.CompletedProcess(
             args=["python"], returncode=2, stdout="", stderr="bad MetricsPort"
