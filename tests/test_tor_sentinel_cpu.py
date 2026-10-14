@@ -1,5 +1,8 @@
 """Regression tests for metrics gaps and Tor CPU accounting (no relay access)."""
+import csv
 import importlib.util
+import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -62,9 +65,9 @@ class IntegrationTests(unittest.TestCase):
             return "test raw", result
         side_effects = [metrics(100), TimeoutError("slow MetricsPort"), metrics(400)]
         times = iter([
-            0.0, 0.1, 0.2, 0.3,       # first success
-            30.0, 34.0, 34.1,       # invalid scrape
-            60.0, 60.1, 60.2, 60.3  # recovery
+            0.0, 0.1, 0.2, 0.3, 0.4,        # first successful scrape
+            30.0, 30.1, 34.0, 34.1, 34.2, 34.3,  # timed-out scrape
+            60.0, 60.1, 60.2, 60.3, 60.4   # successful recovery
         ])
         rows, events = [], []
         calls = [0]
@@ -75,7 +78,7 @@ class IntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td, \
              patch.object(monitor, "OUTPUT_DIR", Path(td)), \
-             patch.object(monitor, "scrape", side_effect=side_effects), \
+             patch.object(monitor, "fetch_snapshot", side_effect=side_effects), \
              patch.object(monitor, "housekeeping"), \
              patch.object(monitor, "event", side_effect=events.append), \
              patch.object(monitor, "append_csv", side_effect=lambda now, row: rows.append(dict(row))), \
@@ -97,13 +100,82 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(rows[1]["interval_sec"], "")
         # 300 new BEGIN_DIRs / 60 s between *successful* snapshots.
         self.assertEqual(rows[2]["begin_dir_per_sec"], "5.00")
-        # CPU rate uses previous /proc measurement (34.0s), not previous
-        # *successful* scrape (0.1s): 100 ticks / 26.2s.
-        self.assertAlmostEqual(float(rows[2]["tor_cpu_pct"]), 3.82, places=2)
+        # CPU ticks advanced across the invalid scrape: 100 ticks / 26.1s.
+        self.assertAlmostEqual(float(rows[2]["tor_cpu_pct"]), 3.83, places=2)
+        self.assertEqual([r["rate_scope"] for r in rows],
+                         ["baseline", "unavailable", "recovery_avg"])
+        self.assertEqual(rows[1]["metrics_status"], "TIMEOUT")
+        self.assertEqual(rows[2]["metrics_status"], "OK")
+        self.assertGreater(float(rows[1]["scrape_duration_ms"]), 3800)
+        self.assertEqual(rows[2]["failed_scrapes_before_sample"], 1)
         self.assertTrue(any("METRICS_UNAVAILABLE" in e for e in events))
         self.assertTrue(any("METRICS_RECOVERED" in e for e in events))
         self.assertFalse(any("STORM_START" in e for e in events))
 
+
+
+class ScrapeDeadlineTests(unittest.TestCase):
+    def test_child_process_has_strict_deadline(self):
+        with patch.object(monitor.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired("sentinel", 5)) as run:
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                monitor.fetch_snapshot()
+        self.assertEqual(run.call_args.kwargs["timeout"], monitor.SCRAPE_DEADLINE)
+        self.assertIn("--scrape-child", run.call_args.args[0])
+
+    def test_child_json_round_trip(self):
+        payload = {"raw": "tor_relay_streams_total 12", "values": {"begin_dir": 12}}
+        complete = subprocess.CompletedProcess(
+            args=["python"], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+        with patch.object(monitor.subprocess, "run", return_value=complete):
+            self.assertEqual(monitor.fetch_snapshot(),
+                             (payload["raw"], payload["values"]))
+
+    def test_worker_failure_propagates_as_error(self):
+        failed = subprocess.CompletedProcess(
+            args=["python"], returncode=2, stdout="", stderr="bad MetricsPort"
+        )
+        with patch.object(monitor.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "bad MetricsPort"):
+                monitor.fetch_snapshot()
+
+
+class CsvCompatibilityTests(unittest.TestCase):
+    def test_new_schema_never_appends_under_legacy_header(self):
+        with tempfile.TemporaryDirectory() as td, \\
+             patch.object(monitor, "OUTPUT_DIR", Path(td)):
+            dt = datetime(2026, 10, 14, tzinfo=timezone.utc)
+            standard = monitor.csv_path_for(dt)
+            original_header = monitor.CSV_HEADER[:21]
+            with standard.open("w", newline="") as out:
+                w = csv.writer(out)
+                w.writerow(original_header)
+                w.writerow(["2026-10-14T01:00:00Z"] + [""] * 20)
+            original = standard.read_bytes()
+
+            sample = {key: "" for key in monitor.CSV_HEADER}
+            sample["utc_time"] = "2026-10-14T01:00:30Z"
+            sample["metrics_status"] = "OK"
+            monitor.append_csv(dt, sample)
+            monitor.append_csv(dt, sample)
+
+            self.assertEqual(standard.read_bytes(), original)
+            upgraded = Path(td) / "begindir-20261014-v02.csv"
+            with upgraded.open(newline="") as inp:
+                data = list(csv.DictReader(inp))
+            self.assertEqual(len(data), 2)
+            self.assertEqual(data[0]["metrics_status"], "OK")
+            self.assertEqual(data[1]["utc_time"], "2026-10-14T01:00:30Z")
+
+    def test_fresh_day_uses_regular_filename(self):
+        with tempfile.TemporaryDirectory() as td, \\
+             patch.object(monitor, "OUTPUT_DIR", Path(td)):
+            dt = datetime(2026, 10, 15, tzinfo=timezone.utc)
+            sample = {key: "" for key in monitor.CSV_HEADER}
+            monitor.append_csv(dt, sample)
+            with monitor.csv_path_for(dt).open(newline="") as inp:
+                self.assertEqual(next(csv.reader(inp)), monitor.CSV_HEADER)
 
 if __name__ == "__main__":
     unittest.main()
