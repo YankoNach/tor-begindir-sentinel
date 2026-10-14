@@ -41,6 +41,7 @@ relay has a significantly different normal BEGIN_DIR baseline.
 
 import csv
 import gzip
+import json
 import os
 import re
 import shutil
@@ -97,6 +98,10 @@ CLEAR_CONFIRM_SAMPLES = 6
 WATCH_CLEAR_SAMPLES = 3
 
 HTTP_TIMEOUT = 4
+# A subprocess isolates a misbehaving local MetricsPort: 4-second socket
+# timeout is NOT an overall read deadline, especially with trickle responses.
+# Hard wall-clock deadline includes Python child startup and JSON transport.
+SCRAPE_DEADLINE = 5.0
 
 # Compress daily CSV files after this many days.
 COMPRESS_AFTER_DAYS = 2
@@ -299,6 +304,13 @@ CSV_HEADER = [
     "rss_MB",
     "counter_reset",
     "sample_valid",
+    # Appended columns preserve the historical CSV prefix and existing readers.
+    "metrics_status",
+    "metrics_error_type",
+    "metrics_age_sec",
+    "scrape_duration_ms",
+    "rate_scope",
+    "failed_scrapes_before_sample",
 ]
 
 
@@ -522,6 +534,35 @@ def scrape():
     return raw, values
 
 
+def fetch_snapshot():
+    """Fetch in a killable child so MetricsPort never blocks this main loop.
+
+    A daemon thread cannot safely be killed if the HTTP response trickles forever.
+    A short-lived local child process keeps the original Tor observer passive and
+    guarantees a bounded scrape wall time. It inherits only the local environment.
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--scrape-child"],
+            capture_output=True, text=True, timeout=SCRAPE_DEADLINE,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"MetricsPort scrape exceeded {SCRAPE_DEADLINE:g}s deadline"
+        ) from exc
+    if completed.returncode != 0:
+        error = (completed.stderr or "").strip()[-350:]
+        raise RuntimeError(
+            f"MetricsPort child failed exit={completed.returncode}: {error}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+        return payload["raw"], payload["values"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError("Invalid MetricsPort child response") from exc
+
+
 def counter_rate(current, previous, elapsed):
     """
     Calculate delta/second for a monotonically increasing Tor counter.
@@ -575,6 +616,8 @@ def main():
 
     previous = None
     previous_monotonic = None
+    invalid_since_good = 0
+    expected_interval = NORMAL_INTERVAL
 
     previous_process = None
     cpu_tracker = CpuTracker(os.sysconf(os.sysconf_names["SC_CLK_TCK"]))
@@ -603,14 +646,21 @@ def main():
         sample_valid = 1
         counter_reset = 0
         metrics_scraped_at = None
+        scrape_duration_ms = None
+        metrics_error_type = ""
+        metrics_status = "OK"
+        rate_scope = "unavailable"
+        scrape_started = time.monotonic()
 
         try:
-            raw, current = scrape()
+            raw, current = fetch_snapshot()
             metrics_scraped_at = time.monotonic()
+            scrape_duration_ms = (metrics_scraped_at - scrape_started) * 1000
             if metrics_unavailable_since is not None:
                 gap = metrics_scraped_at - metrics_unavailable_since
                 event(
                     f"METRICS_RECOVERED gap={gap:.1f}s "
+                    f"failed_samples={invalid_since_good} "
                     "counters_averaged_over_successful_scrape_interval"
                 )
                 metrics_unavailable_since = None
@@ -618,18 +668,43 @@ def main():
 
         except Exception as exc:
             sample_valid = 0
+            invalid_since_good += 1
             current = None
             raw = ""
+            scrape_duration_ms = (time.monotonic() - scrape_started) * 1000
+            metrics_error_type = type(exc).__name__
+            metrics_status = (
+                "TIMEOUT" if isinstance(exc, TimeoutError) else "ERROR"
+            )
             if metrics_unavailable_since is None:
                 metrics_unavailable_since = loop_started
                 event("METRICS_UNAVAILABLE")
 
             error_text = f"{type(exc).__name__}: {exc}"
 
-            # Do not write the same network/metrics error every few seconds.
+            # Avoid repeated identical errors during a prolonged outage.
             if error_text != last_error:
                 event(f"METRICS_ERROR {error_text}")
                 last_error = error_text
+
+            # A failed scrape breaks a sequence of consecutive storm samples.
+            storm_confirm = 0
+            clear_confirm = 0
+            watch_clear = 0
+
+        # CSV time is assigned after the scrape, not before a slow HTTP read.
+        now = utc_now()
+        metrics_age_sec = (
+            max(0.0, time.monotonic() - previous_monotonic)
+            if not sample_valid and previous_monotonic is not None
+            else (0.0 if sample_valid else None)
+        )
+        if (
+            not sample_valid
+            and (metrics_age_sec is None
+                 or metrics_age_sec > 2.5 * expected_interval)
+        ):
+            metrics_status = "STALE"
 
         pid = find_tor_pid()
 
@@ -677,6 +752,16 @@ def main():
         if sample_valid and previous_monotonic is not None:
             elapsed = metrics_scraped_at - previous_monotonic
 
+        if sample_valid:
+            if previous is None or elapsed is None or elapsed <= 0:
+                rate_scope = "baseline"
+            elif invalid_since_good:
+                rate_scope = "recovery_avg"
+            elif elapsed > 2.5 * expected_interval:
+                rate_scope = "extended_avg"
+            else:
+                rate_scope = "regular"
+
         rates = {
             "begin_dir": None,
             "ntor_processed": None,
@@ -701,6 +786,12 @@ def main():
 
                 if reset:
                     counter_reset = 1
+
+        if counter_reset:
+            rate_scope = "reset"
+            storm_confirm = 0
+            clear_confirm = 0
+            watch_clear = 0
 
         read_mbps = (
             rates["read_bytes"] / 1_000_000
@@ -729,7 +820,9 @@ def main():
         # Detector state machine
         # ---------------------------------------------------------------
 
-        if begin_rate is not None and not counter_reset:
+        # Recovery/extended averages do not reveal the real instantaneous
+        # peak or event boundary. Do NOT drive detector transitions with them.
+        if begin_rate is not None and rate_scope == "regular":
 
             if state == "NORMAL":
 
@@ -885,6 +978,14 @@ def main():
             "rss_MB": fmt(rss_mb, 1),
             "counter_reset": counter_reset,
             "sample_valid": sample_valid,
+            "metrics_status": metrics_status,
+            "metrics_error_type": metrics_error_type,
+            "metrics_age_sec": fmt(metrics_age_sec, 1),
+            "scrape_duration_ms": fmt(scrape_duration_ms, 1),
+            "rate_scope": rate_scope,
+            "failed_scrapes_before_sample": (
+                invalid_since_good if sample_valid else ""
+            ),
         }
 
         append_csv(now, row)
@@ -894,6 +995,7 @@ def main():
         if sample_valid:
             previous = current
             previous_monotonic = metrics_scraped_at
+            invalid_since_good = 0
 
         previous_process = current_process
 
@@ -903,6 +1005,7 @@ def main():
             else NORMAL_INTERVAL
         )
 
+        expected_interval = interval
         spent = time.monotonic() - loop_started
         sleep_for = max(0.0, interval - spent)
 
@@ -912,10 +1015,20 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        event(
-            f"FATAL_ERROR {type(exc).__name__}: {exc}"
-        )
-        raise
+    if sys.argv[1:] == ["--scrape-child"]:
+        # Internal worker entrypoint, not a standalone monitoring service.
+        try:
+            raw, values = scrape()
+            sys.stdout.write(json.dumps({"raw": raw, "values": values}))
+        except Exception as exc:
+            sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
+            sys.exit(2)
+    elif len(sys.argv) > 1:
+        sys.stderr.write("Unknown arguments to Sentinel\n")
+        sys.exit(2)
+    else:
+        try:
+            main()
+        except Exception as exc:
+            event(f"FATAL_ERROR {type(exc).__name__}: {exc}")
+            raise
