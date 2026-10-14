@@ -41,6 +41,8 @@ relay has a significantly different normal BEGIN_DIR baseline.
 
 import csv
 import gzip
+import json
+import math
 import os
 import re
 import shutil
@@ -97,6 +99,10 @@ CLEAR_CONFIRM_SAMPLES = 6
 WATCH_CLEAR_SAMPLES = 3
 
 HTTP_TIMEOUT = 4
+# A subprocess isolates a misbehaving local MetricsPort: 4-second socket
+# timeout is NOT an overall read deadline, especially with trickle responses.
+# Hard wall-clock deadline includes Python child startup and JSON transport.
+SCRAPE_DEADLINE = 5.0
 
 # Compress daily CSV files after this many days.
 COMPRESS_AFTER_DAYS = 2
@@ -139,6 +145,9 @@ def parse_metrics(text):
         try:
             value = float(parts[1])
         except ValueError:
+            continue
+        # Non-finite values must not masquerade as valid counters/gauges.
+        if not math.isfinite(value):
             continue
 
         if "{" in identity:
@@ -209,29 +218,21 @@ def find_tor_pid():
         return None
 
 
-def read_cpu_ticks(path):
-    """
-    Read utime + stime from /proc/.../stat.
-
-    /proc/<pid>/stat is used for total Tor process CPU.
-    /proc/<pid>/task/<pid>/stat is used for Tor's main thread.
-    """
+def read_cpu_stat(path):
+    """Read (utime+stime, kernel starttime) from a /proc/.../stat entry."""
     try:
-        text = Path(path).read_text()
-
-        # The process name in parentheses may theoretically contain spaces.
-        # Everything after the final ')' has stable field positions.
-        after_name = text.rsplit(")", 1)[1].strip().split()
-
-        # Original proc fields 14 and 15 become indexes 11 and 12 here
-        # because fields 1 and 2 were removed above.
-        utime = int(after_name[11])
-        stime = int(after_name[12])
-
-        return utime + stime
-
+        content = Path(path).read_text()
+        fields = content.rsplit(")", 1)[1].strip().split()
+        # After removing pid and comm, utime=11, stime=12, starttime=19.
+        return int(fields[11]) + int(fields[12]), int(fields[19])
     except (OSError, ValueError, IndexError):
         return None
+
+
+def read_cpu_ticks(path):
+    """Read utime+stime from /proc/<pid>/[task/<pid>/]stat."""
+    stat = read_cpu_stat(path)
+    return stat[0] if stat is not None else None
 
 
 def read_rss_mb(pid):
@@ -245,6 +246,40 @@ def read_rss_mb(pid):
         pass
 
     return None
+
+
+class CpuTracker:
+    """Track CPU deltas on every loop, independently of MetricsPort validity.
+
+    Whole-process CPU is measured as a percentage of one logical CPU.
+    Kernel starttime guards against PID recycling and reset across restarts.
+    """
+
+    def __init__(self, clk_tck):
+        self.clk_tck = clk_tck
+        self.previous = None
+
+    def observe(self, pid, start_ticks, proc_ticks, main_ticks, sampled_at):
+        previous = self.previous
+        self.previous = None
+
+        if pid is None or start_ticks is None or proc_ticks is None:
+            return None, None
+
+        self.previous = (pid, start_ticks, proc_ticks, main_ticks, sampled_at)
+        if previous is None or (pid, start_ticks) != previous[:2]:
+            return None, None
+
+        elapsed = sampled_at - previous[4]
+        if elapsed <= 0:
+            return None, None
+
+        def percent(current, old):
+            if current is None or old is None or current < old:
+                return None
+            return (current - old) / self.clk_tck / elapsed * 100.0
+
+        return percent(proc_ticks, previous[2]), percent(main_ticks, previous[3])
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +308,13 @@ CSV_HEADER = [
     "rss_MB",
     "counter_reset",
     "sample_valid",
+    # Appended columns preserve the historical CSV prefix and existing readers.
+    "metrics_status",
+    "metrics_error_type",
+    "metrics_age_sec",
+    "scrape_duration_ms",
+    "rate_scope",
+    "failed_scrapes_before_sample",
 ]
 
 
@@ -305,14 +347,27 @@ def csv_path_for(dt):
 
 def append_csv(dt, row):
     path = csv_path_for(dt)
-    new_file = not path.exists()
+    if path.exists() and path.stat().st_size:
+        with path.open(newline="") as source:
+            existing_header = next(csv.reader(source), [])
+        if existing_header != CSV_HEADER:
+            # Do not append a newer CSV layout under an older header.
+            # Both filenames retain the YYYYMMDD token for housekeeping and
+            # are picked up by the existing private publisher's CSV glob.
+            path = path.with_name(path.stem + "-v02.csv")
+            if path.exists() and path.stat().st_size:
+                with path.open(newline="") as source:
+                    alternate_header = next(csv.reader(source), [])
+                if alternate_header != CSV_HEADER:
+                    raise RuntimeError(
+                        f"Refusing to append incompatible CSV layout: {path}"
+                    )
 
-    with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-
+    new_file = not path.exists() or not path.stat().st_size
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_HEADER)
         if new_file:
             writer.writeheader()
-
         writer.writerow(row)
 
 
@@ -496,6 +551,37 @@ def scrape():
     return raw, values
 
 
+def fetch_snapshot():
+    """Fetch in a killable child so MetricsPort never blocks this main loop.
+
+    A daemon thread cannot safely be killed if the HTTP response trickles forever.
+    A short-lived local child process keeps the original Tor observer passive and
+    guarantees a bounded scrape wall time. It inherits only the local environment.
+    """
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--scrape-child"],
+            capture_output=True, text=True, timeout=SCRAPE_DEADLINE,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"MetricsPort scrape exceeded {SCRAPE_DEADLINE:g}s deadline"
+        ) from exc
+    if completed.returncode != 0:
+        error = (completed.stderr or "").strip()[-350:]
+        if error.startswith(("TimeoutError:", "socket.timeout:")):
+            raise TimeoutError(f"MetricsPort child timed out: {error}")
+        raise RuntimeError(
+            f"MetricsPort child failed exit={completed.returncode}: {error}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+        return payload["raw"], payload["values"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError("Invalid MetricsPort child response") from exc
+
+
 def counter_rate(current, previous, elapsed):
     """
     Calculate delta/second for a monotonically increasing Tor counter.
@@ -549,14 +635,14 @@ def main():
 
     previous = None
     previous_monotonic = None
+    invalid_since_good = 0
+    expected_interval = NORMAL_INTERVAL
 
-    previous_pid = None
-    previous_proc_ticks = None
-    previous_main_ticks = None
-
-    clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    previous_process = None
+    cpu_tracker = CpuTracker(os.sysconf(os.sysconf_names["SC_CLK_TCK"]))
 
     last_error = None
+    metrics_unavailable_since = None
     last_housekeeping_day = None
 
     event(
@@ -578,52 +664,122 @@ def main():
 
         sample_valid = 1
         counter_reset = 0
+        metrics_scraped_at = None
+        scrape_duration_ms = None
+        metrics_error_type = ""
+        metrics_status = "OK"
+        rate_scope = "unavailable"
+        scrape_started = time.monotonic()
 
         try:
-            raw, current = scrape()
+            raw, current = fetch_snapshot()
+            metrics_scraped_at = time.monotonic()
+            scrape_duration_ms = (metrics_scraped_at - scrape_started) * 1000
+            if metrics_unavailable_since is not None:
+                gap = metrics_scraped_at - metrics_unavailable_since
+                event(
+                    f"METRICS_RECOVERED gap={gap:.1f}s "
+                    f"failed_samples={invalid_since_good} "
+                    "counters_averaged_over_successful_scrape_interval"
+                )
+                metrics_unavailable_since = None
             last_error = None
 
         except Exception as exc:
             sample_valid = 0
+            invalid_since_good += 1
             current = None
             raw = ""
+            scrape_duration_ms = (time.monotonic() - scrape_started) * 1000
+            metrics_error_type = type(exc).__name__
+            metrics_status = (
+                "TIMEOUT" if isinstance(exc, TimeoutError) else "ERROR"
+            )
+            if metrics_unavailable_since is None:
+                metrics_unavailable_since = loop_started
+                event("METRICS_UNAVAILABLE")
 
             error_text = f"{type(exc).__name__}: {exc}"
 
-            # Do not write the same network/metrics error every few seconds.
+            # Avoid repeated identical errors during a prolonged outage.
             if error_text != last_error:
                 event(f"METRICS_ERROR {error_text}")
                 last_error = error_text
 
+            # A failed scrape breaks a sequence of consecutive storm samples.
+            storm_confirm = 0
+            clear_confirm = 0
+            watch_clear = 0
+
+        # CSV time is assigned after the scrape, not before a slow HTTP read.
+        now = utc_now()
+        metrics_age_sec = (
+            max(0.0, time.monotonic() - previous_monotonic)
+            if not sample_valid and previous_monotonic is not None
+            else (0.0 if sample_valid else None)
+        )
+        if (
+            not sample_valid
+            and (metrics_age_sec is None
+                 or metrics_age_sec > 2.5 * expected_interval)
+        ):
+            metrics_status = "STALE"
+
         pid = find_tor_pid()
 
         proc_ticks = None
+        proc_start_ticks = None
         main_ticks = None
         rss_mb = None
 
         if pid is not None:
-            proc_ticks = read_cpu_ticks(f"/proc/{pid}/stat")
-            main_ticks = read_cpu_ticks(
-                f"/proc/{pid}/task/{pid}/stat"
-            )
+            proc_stat = read_cpu_stat(f"/proc/{pid}/stat")
+            if proc_stat is not None:
+                proc_ticks, proc_start_ticks = proc_stat
+            main_ticks = read_cpu_ticks(f"/proc/{pid}/task/{pid}/stat")
             rss_mb = read_rss_mb(pid)
 
-        if (
-            previous_pid is not None
-            and pid is not None
-            and pid != previous_pid
-        ):
-            event(f"TOR_PID_CHANGE old={previous_pid} new={pid}")
+        cpu_sampled_at = time.monotonic()
+        tor_cpu_pct, tor_main_cpu_pct = cpu_tracker.observe(
+            pid, proc_start_ticks, proc_ticks, main_ticks, cpu_sampled_at
+        )
 
+        current_process = (
+            (pid, proc_start_ticks)
+            if pid is not None and proc_start_ticks is not None
+            else None
+        )
+        if previous_process is not None and current_process != previous_process:
+            if current_process is None:
+                event(f"TOR_PROCESS_MISSING old={previous_process}")
+            elif previous_process[0] != current_process[0]:
+                # Keep the original event name for downstream consumers.
+                event(
+                    f"TOR_PID_CHANGE old={previous_process[0]} "
+                    f"new={current_process[0]}"
+                )
+            else:
+                event(
+                    f"TOR_PROCESS_RESTART pid={pid} "
+                    f"old_start={previous_process[1]} "
+                    f"new_start={proc_start_ticks}"
+                )
             previous = None
             previous_monotonic = None
-            previous_proc_ticks = None
-            previous_main_ticks = None
 
         elapsed = None
+        if sample_valid and previous_monotonic is not None:
+            elapsed = metrics_scraped_at - previous_monotonic
 
-        if previous_monotonic is not None:
-            elapsed = loop_started - previous_monotonic
+        if sample_valid:
+            if previous is None or elapsed is None or elapsed <= 0:
+                rate_scope = "baseline"
+            elif invalid_since_good:
+                rate_scope = "recovery_avg"
+            elif elapsed > 2.5 * expected_interval:
+                rate_scope = "extended_avg"
+            else:
+                rate_scope = "regular"
 
         rates = {
             "begin_dir": None,
@@ -650,34 +806,11 @@ def main():
                 if reset:
                     counter_reset = 1
 
-        tor_cpu_pct = None
-        tor_main_cpu_pct = None
-
-        if (
-            elapsed
-            and proc_ticks is not None
-            and previous_proc_ticks is not None
-            and proc_ticks >= previous_proc_ticks
-        ):
-            tor_cpu_pct = (
-                (proc_ticks - previous_proc_ticks)
-                / clk_tck
-                / elapsed
-                * 100.0
-            )
-
-        if (
-            elapsed
-            and main_ticks is not None
-            and previous_main_ticks is not None
-            and main_ticks >= previous_main_ticks
-        ):
-            tor_main_cpu_pct = (
-                (main_ticks - previous_main_ticks)
-                / clk_tck
-                / elapsed
-                * 100.0
-            )
+        if counter_reset:
+            rate_scope = "reset"
+            storm_confirm = 0
+            clear_confirm = 0
+            watch_clear = 0
 
         read_mbps = (
             rates["read_bytes"] / 1_000_000
@@ -706,7 +839,9 @@ def main():
         # Detector state machine
         # ---------------------------------------------------------------
 
-        if begin_rate is not None and not counter_reset:
+        # Recovery/extended averages do not reveal the real instantaneous
+        # peak or event boundary. Do NOT drive detector transitions with them.
+        if begin_rate is not None and rate_scope == "regular":
 
             if state == "NORMAL":
 
@@ -862,22 +997,26 @@ def main():
             "rss_MB": fmt(rss_mb, 1),
             "counter_reset": counter_reset,
             "sample_valid": sample_valid,
+            "metrics_status": metrics_status,
+            "metrics_error_type": metrics_error_type,
+            "metrics_age_sec": fmt(metrics_age_sec, 1),
+            "scrape_duration_ms": fmt(scrape_duration_ms, 1),
+            "rate_scope": rate_scope,
+            "failed_scrapes_before_sample": (
+                invalid_since_good if sample_valid else ""
+            ),
         }
 
         append_csv(now, row)
 
-        # Update baselines only from a valid scrape.
+        # Metrics counter baseline advances only on valid scrapes.
+        # CPU baseline is independent and was updated by CpuTracker above.
         if sample_valid:
             previous = current
-            previous_monotonic = loop_started
+            previous_monotonic = metrics_scraped_at
+            invalid_since_good = 0
 
-        previous_pid = pid
-
-        if proc_ticks is not None:
-            previous_proc_ticks = proc_ticks
-
-        if main_ticks is not None:
-            previous_main_ticks = main_ticks
+        previous_process = current_process
 
         interval = (
             FAST_INTERVAL
@@ -885,6 +1024,7 @@ def main():
             else NORMAL_INTERVAL
         )
 
+        expected_interval = interval
         spent = time.monotonic() - loop_started
         sleep_for = max(0.0, interval - spent)
 
@@ -894,10 +1034,20 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        event(
-            f"FATAL_ERROR {type(exc).__name__}: {exc}"
-        )
-        raise
+    if sys.argv[1:] == ["--scrape-child"]:
+        # Internal worker entrypoint, not a standalone monitoring service.
+        try:
+            raw, values = scrape()
+            sys.stdout.write(json.dumps({"raw": raw, "values": values}))
+        except Exception as exc:
+            sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
+            sys.exit(2)
+    elif len(sys.argv) > 1:
+        sys.stderr.write("Unknown arguments to Sentinel\n")
+        sys.exit(2)
+    else:
+        try:
+            main()
+        except Exception as exc:
+            event(f"FATAL_ERROR {type(exc).__name__}: {exc}")
+            raise
