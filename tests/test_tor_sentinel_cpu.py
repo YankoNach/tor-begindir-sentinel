@@ -1,6 +1,10 @@
 """Regression tests for metrics gaps and Tor CPU accounting (no relay access)."""
 import csv
+import http.server
 import importlib.util
+import os
+import threading
+import time
 import json
 import subprocess
 import tempfile
@@ -141,6 +145,41 @@ class ScrapeDeadlineTests(unittest.TestCase):
         with patch.object(monitor.subprocess, "run", return_value=complete):
             self.assertEqual(monitor.fetch_snapshot(),
                              (payload["raw"], payload["values"]))
+
+    def test_real_trickling_http_response_is_killed_by_deadline(self):
+        """A socket may keep receiving bytes while never completing a scrape."""
+        class TricklingHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(b"# Incomplete Tor metrics response\\n")
+                    self.wfile.flush()
+                    time.sleep(3)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), TricklingHandler
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            with patch.dict(os.environ, {
+                "TOR_METRICS_URL": f"http://127.0.0.1:{port}/metrics",
+                "no_proxy": "127.0.0.1",
+            }), patch.object(monitor, "SCRAPE_DEADLINE", 1.0):
+                started = time.monotonic()
+                with self.assertRaisesRegex(TimeoutError, "deadline"):
+                    monitor.fetch_snapshot()
+                self.assertLess(time.monotonic() - started, 2.8)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_worker_failure_propagates_as_error(self):
         failed = subprocess.CompletedProcess(
