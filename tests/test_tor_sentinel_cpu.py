@@ -143,8 +143,8 @@ class ScrapeDeadlineTests(unittest.TestCase):
 
 class CsvCompatibilityTests(unittest.TestCase):
     def test_new_schema_never_appends_under_legacy_header(self):
-        with tempfile.TemporaryDirectory() as td, \\
-             patch.object(monitor, "OUTPUT_DIR", Path(td)):
+        with (tempfile.TemporaryDirectory() as td,
+              patch.object(monitor, "OUTPUT_DIR", Path(td))):
             dt = datetime(2026, 10, 14, tzinfo=timezone.utc)
             standard = monitor.csv_path_for(dt)
             original_header = monitor.CSV_HEADER[:21]
@@ -169,8 +169,8 @@ class CsvCompatibilityTests(unittest.TestCase):
             self.assertEqual(data[1]["utc_time"], "2026-10-14T01:00:30Z")
 
     def test_fresh_day_uses_regular_filename(self):
-        with tempfile.TemporaryDirectory() as td, \\
-             patch.object(monitor, "OUTPUT_DIR", Path(td)):
+        with (tempfile.TemporaryDirectory() as td,
+              patch.object(monitor, "OUTPUT_DIR", Path(td))):
             dt = datetime(2026, 10, 15, tzinfo=timezone.utc)
             sample = {key: "" for key in monitor.CSV_HEADER}
             monitor.append_csv(dt, sample)
