@@ -63,17 +63,23 @@ class IntegrationTests(unittest.TestCase):
             result = {key: (v if key == "begin_dir" else 0) for key in counter_keys}
             result.update(guard=1, hsdir=1, open_circuits=3, open_sockets=4)
             return "test raw", result
-        side_effects = [metrics(100), TimeoutError("slow MetricsPort"), metrics(400)]
+        side_effects = [
+            metrics(100),
+            TimeoutError("slow MetricsPort"),
+            metrics(120100),  # 2000/s average over a 60-second outage
+            metrics(122100),  # 66.7/s across one clean 30-second interval
+        ]
         times = iter([
             0.0, 0.1, 0.2, 0.3, 0.4,        # first successful scrape
             30.0, 30.1, 34.0, 34.1, 34.2, 34.3,  # timed-out scrape
-            60.0, 60.1, 60.2, 60.3, 60.4   # successful recovery
+            60.0, 60.1, 60.2, 60.3, 60.4,  # recovery
+            90.0, 90.1, 90.2, 90.3, 90.4   # next clean sample
         ])
         rows, events = [], []
         calls = [0]
         def no_sleep(_):
             calls[0] += 1
-            if calls[0] >= 3:
+            if calls[0] >= 4:
                 monitor.running = False
 
         with tempfile.TemporaryDirectory() as td, \
@@ -83,8 +89,8 @@ class IntegrationTests(unittest.TestCase):
              patch.object(monitor, "event", side_effect=events.append), \
              patch.object(monitor, "append_csv", side_effect=lambda now, row: rows.append(dict(row))), \
              patch.object(monitor, "find_tor_pid", return_value=4321), \
-             patch.object(monitor, "read_cpu_stat", side_effect=[(100, 900), (400, 900), (500, 900)]), \
-             patch.object(monitor, "read_cpu_ticks", side_effect=[50, 300, 350]), \
+             patch.object(monitor, "read_cpu_stat", side_effect=[(100, 900), (400, 900), (500, 900), (600, 900)]), \
+             patch.object(monitor, "read_cpu_ticks", side_effect=[50, 300, 350, 400]), \
              patch.object(monitor, "read_rss_mb", return_value=40), \
              patch.object(monitor, "utc_now", return_value=datetime(2026, 10, 14, tzinfo=timezone.utc)), \
              patch.object(monitor.time, "monotonic", side_effect=lambda: next(times)), \
@@ -95,15 +101,18 @@ class IntegrationTests(unittest.TestCase):
             finally:
                 monitor.running = True
 
-        self.assertEqual([r["sample_valid"] for r in rows], [1, 0, 1])
+        self.assertEqual([r["sample_valid"] for r in rows], [1, 0, 1, 1])
         self.assertEqual(rows[1]["begin_dir_per_sec"], "")
         self.assertEqual(rows[1]["interval_sec"], "")
-        # 300 new BEGIN_DIRs / 60 s between *successful* snapshots.
-        self.assertEqual(rows[2]["begin_dir_per_sec"], "5.00")
+        # Recovery average is numerically correct, but NOT a verified peak.
+        self.assertEqual(rows[2]["begin_dir_per_sec"], "2000.00")
+        self.assertEqual(rows[2]["state"], "NORMAL")
+        self.assertEqual(rows[3]["rate_scope"], "regular")
+        self.assertEqual(rows[3]["state"], "WATCH")
         # CPU ticks advanced across the invalid scrape: 100 ticks / 26.1s.
         self.assertAlmostEqual(float(rows[2]["tor_cpu_pct"]), 3.83, places=2)
         self.assertEqual([r["rate_scope"] for r in rows],
-                         ["baseline", "unavailable", "recovery_avg"])
+                         ["baseline", "unavailable", "recovery_avg", "regular"])
         self.assertEqual(rows[1]["metrics_status"], "TIMEOUT")
         self.assertEqual(rows[2]["metrics_status"], "OK")
         self.assertGreater(float(rows[1]["scrape_duration_ms"]), 3800)
@@ -111,6 +120,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(any("METRICS_UNAVAILABLE" in e for e in events))
         self.assertTrue(any("METRICS_RECOVERED" in e for e in events))
         self.assertFalse(any("STORM_START" in e for e in events))
+        self.assertEqual(sum("WATCH_START" in e for e in events), 1)
 
 
 
