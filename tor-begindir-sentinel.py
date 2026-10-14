@@ -343,14 +343,27 @@ def csv_path_for(dt):
 
 def append_csv(dt, row):
     path = csv_path_for(dt)
-    new_file = not path.exists()
+    if path.exists() and path.stat().st_size:
+        with path.open(newline="") as source:
+            existing_header = next(csv.reader(source), [])
+        if existing_header != CSV_HEADER:
+            # Do not append a newer CSV layout under an older header.
+            # Both filenames retain the YYYYMMDD token for housekeeping and
+            # are picked up by the existing private publisher's CSV glob.
+            path = path.with_name(path.stem + "-v02.csv")
+            if path.exists() and path.stat().st_size:
+                with path.open(newline="") as source:
+                    alternate_header = next(csv.reader(source), [])
+                if alternate_header != CSV_HEADER:
+                    raise RuntimeError(
+                        f"Refusing to append incompatible CSV layout: {path}"
+                    )
 
-    with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-
+    new_file = not path.exists() or not path.stat().st_size
+    with path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_HEADER)
         if new_file:
             writer.writeheader()
-
         writer.writerow(row)
 
 
