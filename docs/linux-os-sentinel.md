@@ -19,9 +19,16 @@ utc_time,elapsed_sec,lag_ms,collect_ms,interface,rx_MBps,tx_MBps,tx_rx_ratio,ifa
 
 Note: If Tor is not installed in a test environment, Tor-specific fields remain blank; OS fields still record. The first sample after startup has blank rate fields by design. CSV rows are emitted every 2 seconds into `~/linux-os-sentinel/linux-os-YYYYMMDD.csv` (UTC day), old files are gzip-compressed after two days and pruned after 30 days. The script does **not** upload its files anywhere. An uploader integration must be reviewed separately.
 
-## Read-only manual smoke test (before installing a service)
+## Installation and manual validation
 
-These commands run on the relay as the unprivileged user who will own the CSVs. Obtain the script from the **reviewed GitHub commit** before proceeding. Download/install steps have deliberately been left to the operator, who can verify code and commit contents.
+Run these commands as the ordinary, unprivileged Linux account that will own the CSVs. Review the code and GitHub commit before installation. The following steps use the repository's public `main` branch **after this release is merged**; while reviewing a proposed change, check out the corresponding proposal branch instead.
+
+```bash
+git clone https://github.com/YankoNach/tor-begindir-sentinel.git ~/tor-begindir-sentinel-source
+install -m 755 ~/tor-begindir-sentinel-source/linux-os-sentinel.py ~/linux-os-sentinel.py
+```
+
+On systems with an existing checkout, update/review that checkout rather than attempting to clone over it. Python 3.10+ and Linux `/proc`/`/sys` are required; there are no third-party Python dependencies. The Tor MetricsPort probe is optional: the monitor works even when Tor is not installed or MetricsPort is not enabled.
 
 ```bash
 python3 -m py_compile ~/linux-os-sentinel.py
@@ -39,28 +46,49 @@ python3 ~/linux-os-sentinel.py --samples 40 --interval 2 --metrics-probe-interva
 
 Stop with Ctrl-C if Tor shows any unexpected performance effect. Check `metrics_probe_status` in the appended CSV. A failed probe is diagnostic; it must not interrupt the host measurements.
 
-## Proposed systemd unit (NOT installed automatically)
+## Optional systemd service (manual opt-in)
 
-`linux-os-sentinel.service.example` is a generic template. Replace `YOUR_USER` with `ubuntu` on Cloud1/Cloud3 or `khankrum` on Cloud2, verify the script's absolute path and permissions, and install only after testing and explicit operator approval.
-
-Suggested validation before enabling a service (operator actions, *not* already executed):
+The repository includes `linux-os-sentinel.service.example`. Installing the service requires `sudo`, but the monitor itself runs as your chosen non-root Linux user. **Never leave `YOUR_USER` in an installed unit.** Review and edit all paths and the interface as needed; the example assumes a user home directory under `/home`.
 
 ```bash
+sudo install -m 644 ~/tor-begindir-sentinel-source/linux-os-sentinel.service.example /etc/systemd/system/linux-os-sentinel.service
+sudoedit /etc/systemd/system/linux-os-sentinel.service
+# Replace YOUR_USER throughout with your account; inspect ExecStart and WorkingDirectory.
 sudo systemd-analyze verify /etc/systemd/system/linux-os-sentinel.service
 sudo systemctl daemon-reload
 sudo systemctl start linux-os-sentinel.service
-systemctl status linux-os-sentinel.service --no-pager
-journalctl -u linux-os-sentinel.service -n 30 --no-pager
+systemctl status linux-os-sentinel.service --no-pager -l
+sudo journalctl -u linux-os-sentinel.service -n 30 --no-pager
 ```
 
-For unattended startup **only after approval**: `sudo systemctl enable linux-os-sentinel.service`. To stop only the OS monitor: `sudo systemctl disable --now linux-os-sentinel.service`. Tor and the existing BEGIN_DIR Sentinel remain untouched.
+Confirm that new UTC-dated CSV rows appear in `~/linux-os-sentinel/` (for the service user) and that `tor_pid` and the network interface are correct. The first row intentionally has blank rate fields. Probe results are **sparse**: blank probe fields mean no probe finished on that sample, not necessarily a failure. When satisfied, enable startup after reboot:
 
-## Before production deployment
+```bash
+sudo systemctl enable linux-os-sentinel.service
+```
 
-1. Run the standard-library tests: `python3 -m unittest discover -s tests -v` from the repo root.
-2. Test smoke sampling on an unprivileged user, including no Tor process, Tor PID changes/restarts, missing PSI, unavailable MetricsPort and interrupted network read.
-3. Ensure the main loop is not blocked by HTTP timeouts. Review overhead and UTC timestamps on Cloud1 first; then deploy Cloud2, Cloud3 separately.
-4. Compare overlapping Tor process CPU and local network rates with the original Sentinel. These measure different traffic scopes and use different clocks.
-5. Design a separate, opt-in addition to the existing **private** `tor-begindir-fleet-data` publisher; do not automatically upload high-frequency OS CSVs until cadence, retention, repository size and privacy have been reviewed.
+To stop and disable only this monitor: `sudo systemctl disable --now linux-os-sentinel.service`. To diagnose errors: `sudo journalctl -u linux-os-sentinel.service -n 100 --no-pager`. Remove its systemd unit and local data only if you actually intend to uninstall them. These steps do not modify Tor, the existing BEGIN_DIR Sentinel, firewall rules, or relay bandwidth limits.
 
-This initial implementation has **not** been exercised on the live Tor relays. GitHub publication of a development branch is not an installation and does not prove systemd state on any relay.
+## Validation status (2026-10-14)
+
+Experimental v0.1 has been exercised on **three live, non-exit Tor relays**: an Oracle AMD x86_64 VM, a Hetzner ARM VM and an Oracle Ampere ARM VM. On each host, short manual smoke tests produced independent `/proc`/network measurements and successful optional local MetricsPort probes; the collector was subsequently installed and observed running as a systemd service. Nine standard-library unit tests exercise parsing, PID/start-time changes, unavailable metrics, and a deliberately delayed local HTTP endpoint. This is useful operational validation, **not** a claim of production hardening or a controlled replay of a BEGIN_DIR storm. Longer-term storm behaviour has not yet been established.
+
+For an offline test of a checkout:
+
+```bash
+cd ~/tor-begindir-sentinel-source
+python3 -m unittest discover -s tests -p 'test_linux_os_sentinel.py' -v
+```
+
+## Important interpretation limits
+
+- `tor_cpu_pct` is a percentage of **one logical CPU**, so whole-process values can exceed 100% when multiple CPU threads execute. If a transient sample exceeds the host's physical/logical capacity, investigate timing, virtualization and sampling artifacts; do not treat that number as a proven sustained load.
+- Interface RX/TX covers **all traffic on the selected interface**, not just Tor. Tor's own relay traffic counters and Linux interface counters are not interchangeable.
+- `host_cpu_pct` reflects total logical CPU capacity; PSI metrics may not be available on every Linux kernel. Missing values remain blank, not zero.
+- The optional background MetricsPort check is a **health/latency probe**, not a stream-counter collector. It does not reconstruct BEGIN_DIR/s while MetricsPort is unresponsive. The independent Linux samples remain available in that situation.
+- CPU/process observations are best compared across the two monitors using close UTC timestamps, allowing for different sampling cadences and scopes.
+- MetricsPort must never be exposed to external networks for this monitor. The Linux agent's optional probe permits only numeric loopback addresses.
+
+## Publishing and privacy
+
+The public Linux OS Sentinel stores measurements **locally only**. It never publishes or uploads them to GitHub or any other server. The project operator uses separate, private, opt-in tooling to publish rolling summaries from the three test hosts; that infrastructure is **not required or installed** by these instructions. Inspect CSV rows, paths, hostname/interface information and raw logs before sharing data publicly. The monitor does not record packet payloads, user IP addresses or circuit identifiers.
