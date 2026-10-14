@@ -1,8 +1,8 @@
 # Tor BEGIN_DIR Storm Sentinel + Linux OS Sentinel
 
-A passive, high-resolution monitor for unusual `BEGIN_DIR` activity on Tor relays.
+This repository provides **two complementary, passive monitoring tools for Tor relays**: **Tor BEGIN_DIR Storm Sentinel** and **Linux OS Sentinel**. They run independently and can be used separately or together.
 
-The Sentinel watches Tor's MetricsPort and Linux `/proc`, records normal relay behaviour, and switches to faster sampling when `BEGIN_DIR` activity rises sharply. It is intended to help relay operators capture precise start/stop timing and correlate the event with traffic, circuit load, socket count, onion-skin processing, Tor CPU usage, and relay flags.
+**Tor BEGIN_DIR Storm Sentinel** polls Tor's local MetricsPort to detect unusual `BEGIN_DIR` activity, capture detailed Tor counters and relay flags, and switch to faster sampling when suspicious activity appears. **Linux OS Sentinel** independently samples Linux `/proc` and `/sys` to record host and Tor-process CPU, memory, system pressure and network-interface traffic, even when Tor's MetricsPort is slow or unresponsive. An optional background MetricsPort latency probe does not block its Linux measurements. Neither tool changes, controls or restarts Tor.
 
 > **Experimental monitoring tool.** This project is not affiliated with or endorsed by the Tor Project. It does **not** mitigate, block, throttle, reload, restart, or otherwise modify Tor.
 
