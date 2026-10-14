@@ -191,7 +191,7 @@ class ScrapeDeadlineTests(unittest.TestCase):
                 monitor.fetch_snapshot()
 
     def test_nonfinite_metrics_are_not_valid_samples(self):
-        raw = 'tor_relay_streams_total{type="BEGIN_DIR"} NaN\\n'
+        raw = 'tor_relay_streams_total{type="BEGIN_DIR"} NaN'
         self.assertIsNone(
             monitor.metric_value(monitor.parse_metrics(raw), "relay_streams_total",
                                  {"type": "BEGIN_DIR"})
