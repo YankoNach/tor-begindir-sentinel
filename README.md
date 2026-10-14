@@ -1,10 +1,25 @@
-# Tor BEGIN_DIR Storm Sentinel
+# Tor BEGIN_DIR Storm Sentinel + Linux OS Sentinel
 
 A passive, high-resolution monitor for unusual `BEGIN_DIR` activity on Tor relays.
 
 The Sentinel watches Tor's MetricsPort and Linux `/proc`, records normal relay behaviour, and switches to faster sampling when `BEGIN_DIR` activity rises sharply. It is intended to help relay operators capture precise start/stop timing and correlate the event with traffic, circuit load, socket count, onion-skin processing, Tor CPU usage, and relay flags.
 
 > **Experimental monitoring tool.** This project is not affiliated with or endorsed by the Tor Project. It does **not** mitigate, block, throttle, reload, restart, or otherwise modify Tor.
+
+## Two complementary, passive monitors
+
+| Tool | Primary purpose | Works without a responsive Tor MetricsPort? |
+| --- | --- | --- |
+| [Tor BEGIN_DIR Storm Sentinel](tor-begindir-sentinel.py) | Reads Tor's localhost MetricsPort, records `BEGIN_DIR/s`, counters, circuit/handshake load, Guard/HSDir flags, and `NORMAL`/`WATCH`/`STORM` transitions. | **No** — stream/counter measurements require successful MetricsPort scrapes. |
+| [Linux OS Sentinel (experimental v0.1)](linux-os-sentinel.py) | Independently samples Linux `/proc` and `/sys` for host/interface RX/TX, Tor process and main-thread CPU, memory/swap, PSI, and timing/collection lag. | **Yes** — the optional background MetricsPort latency probe never blocks OS sampling. |
+
+The tools can be installed and run **independently or together**. Neither changes Tor configuration, restarts Tor, blocks connections, opens listening ports or requires ControlPort access. Linux OS Sentinel collects every **2 seconds** by default and writes one UTC-dated local CSV per day. Its optional loopback-only MetricsPort health probe runs at most once per **60 seconds** by default; use `--metrics-probe-interval 0` to disable it.
+
+**Getting started:** For the original Tor monitor, see [Tor MetricsPort setup](#tor-begin_dir-sentinel-metricsport-setup) and [Tor BEGIN_DIR installation](#tor-begin_dir-sentinel-installation). For the independent monitor, see the [Linux OS Sentinel installation and operating guide](docs/linux-os-sentinel.md) and [example systemd unit](linux-os-sentinel.service.example).
+
+Linux OS Sentinel v0.1 was manually tested and deployed on three live non-exit relays (Oracle AMD, Hetzner ARM and Oracle Ampere ARM) on 2026-10-14. It has not yet been validated during a new controlled BEGIN_DIR storm. The old Tor Sentinel has a known CPU accounting limitation following failed MetricsPort scrapes; a separate fix is being developed and must not be presumed present in this release.
+
+**Data handling:** Both agents write observations locally. Neither agent uploads to GitHub or any third-party service. Any publication of summaries from the project operator's hosts uses separate, optional, private infrastructure, not included here.
 
 ## Why this exists
 
@@ -37,7 +52,7 @@ The 22:32 sample spans the transition, so it is a mixed five-minute average rath
 
 This abrupt transition is one of the reasons the Sentinel uses much shorter sampling intervals: 30 seconds normally and 10 seconds while suspicious activity is present.
 
-## What it records
+## What the BEGIN_DIR Sentinel records
 
 By default the Sentinel records:
 
@@ -130,7 +145,7 @@ Old CSV files are compressed after 2 days. Default retention is 30 days.
 
 The first sample after a Sentinel start has intentionally blank rate fields because there is no previous counter baseline yet.
 
-## Requirements
+## Tor BEGIN_DIR Sentinel requirements
 
 - Linux
 - Python 3
@@ -139,7 +154,7 @@ The first sample after a Sentinel start has intentionally blank rate fields beca
 
 The monitor uses only the Python standard library.
 
-## Tor configuration
+## Tor BEGIN_DIR Sentinel MetricsPort setup
 
 A local MetricsPort is required and localhost must be allowed by the MetricsPort policy. For example:
 
@@ -151,7 +166,7 @@ MetricsPortPolicy accept 127.0.0.1
 
 Check your Tor configuration before reloading it.
 
-## Installation
+## Tor BEGIN_DIR Sentinel installation
 
 Place the script in the relay user's home directory:
 
