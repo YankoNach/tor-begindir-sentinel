@@ -209,29 +209,21 @@ def find_tor_pid():
         return None
 
 
-def read_cpu_ticks(path):
-    """
-    Read utime + stime from /proc/.../stat.
-
-    /proc/<pid>/stat is used for total Tor process CPU.
-    /proc/<pid>/task/<pid>/stat is used for Tor's main thread.
-    """
+def read_cpu_stat(path):
+    """Read (utime+stime, kernel starttime) from a /proc/.../stat entry."""
     try:
-        text = Path(path).read_text()
-
-        # The process name in parentheses may theoretically contain spaces.
-        # Everything after the final ')' has stable field positions.
-        after_name = text.rsplit(")", 1)[1].strip().split()
-
-        # Original proc fields 14 and 15 become indexes 11 and 12 here
-        # because fields 1 and 2 were removed above.
-        utime = int(after_name[11])
-        stime = int(after_name[12])
-
-        return utime + stime
-
+        content = Path(path).read_text()
+        fields = content.rsplit(")", 1)[1].strip().split()
+        # After removing pid and comm, utime=11, stime=12, starttime=19.
+        return int(fields[11]) + int(fields[12]), int(fields[19])
     except (OSError, ValueError, IndexError):
         return None
+
+
+def read_cpu_ticks(path):
+    """Read utime+stime from /proc/<pid>/[task/<pid>/]stat."""
+    stat = read_cpu_stat(path)
+    return stat[0] if stat is not None else None
 
 
 def read_rss_mb(pid):
@@ -245,6 +237,40 @@ def read_rss_mb(pid):
         pass
 
     return None
+
+
+class CpuTracker:
+    """Track CPU deltas on every loop, independently of MetricsPort validity.
+
+    Whole-process CPU is measured as a percentage of one logical CPU.
+    Kernel starttime guards against PID recycling and reset across restarts.
+    """
+
+    def __init__(self, clk_tck):
+        self.clk_tck = clk_tck
+        self.previous = None
+
+    def observe(self, pid, start_ticks, proc_ticks, main_ticks, sampled_at):
+        previous = self.previous
+        self.previous = None
+
+        if pid is None or start_ticks is None or proc_ticks is None:
+            return None, None
+
+        self.previous = (pid, start_ticks, proc_ticks, main_ticks, sampled_at)
+        if previous is None or (pid, start_ticks) != previous[:2]:
+            return None, None
+
+        elapsed = sampled_at - previous[4]
+        if elapsed <= 0:
+            return None, None
+
+        def percent(current, old):
+            if current is None or old is None or current < old:
+                return None
+            return (current - old) / self.clk_tck / elapsed * 100.0
+
+        return percent(proc_ticks, previous[2]), percent(main_ticks, previous[3])
 
 
 # ---------------------------------------------------------------------------
@@ -550,13 +576,11 @@ def main():
     previous = None
     previous_monotonic = None
 
-    previous_pid = None
-    previous_proc_ticks = None
-    previous_main_ticks = None
-
-    clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    previous_process = None
+    cpu_tracker = CpuTracker(os.sysconf(os.sysconf_names["SC_CLK_TCK"]))
 
     last_error = None
+    metrics_unavailable_since = None
     last_housekeeping_day = None
 
     event(
@@ -578,15 +602,27 @@ def main():
 
         sample_valid = 1
         counter_reset = 0
+        metrics_scraped_at = None
 
         try:
             raw, current = scrape()
+            metrics_scraped_at = time.monotonic()
+            if metrics_unavailable_since is not None:
+                gap = metrics_scraped_at - metrics_unavailable_since
+                event(
+                    f"METRICS_RECOVERED gap={gap:.1f}s "
+                    "counters_averaged_over_successful_scrape_interval"
+                )
+                metrics_unavailable_since = None
             last_error = None
 
         except Exception as exc:
             sample_valid = 0
             current = None
             raw = ""
+            if metrics_unavailable_since is None:
+                metrics_unavailable_since = loop_started
+                event("METRICS_UNAVAILABLE")
 
             error_text = f"{type(exc).__name__}: {exc}"
 
@@ -598,32 +634,38 @@ def main():
         pid = find_tor_pid()
 
         proc_ticks = None
+        proc_start_ticks = None
         main_ticks = None
         rss_mb = None
 
         if pid is not None:
-            proc_ticks = read_cpu_ticks(f"/proc/{pid}/stat")
-            main_ticks = read_cpu_ticks(
-                f"/proc/{pid}/task/{pid}/stat"
-            )
+            proc_stat = read_cpu_stat(f"/proc/{pid}/stat")
+            if proc_stat is not None:
+                proc_ticks, proc_start_ticks = proc_stat
+            main_ticks = read_cpu_ticks(f"/proc/{pid}/task/{pid}/stat")
             rss_mb = read_rss_mb(pid)
 
-        if (
-            previous_pid is not None
-            and pid is not None
-            and pid != previous_pid
-        ):
-            event(f"TOR_PID_CHANGE old={previous_pid} new={pid}")
+        cpu_sampled_at = time.monotonic()
+        tor_cpu_pct, tor_main_cpu_pct = cpu_tracker.observe(
+            pid, proc_start_ticks, proc_ticks, main_ticks, cpu_sampled_at
+        )
 
+        current_process = (
+            (pid, proc_start_ticks)
+            if pid is not None and proc_start_ticks is not None
+            else None
+        )
+        if previous_process is not None and current_process != previous_process:
+            event(
+                f"TOR_PROCESS_CHANGE old={previous_process} "
+                f"new={current_process}"
+            )
             previous = None
             previous_monotonic = None
-            previous_proc_ticks = None
-            previous_main_ticks = None
 
         elapsed = None
-
-        if previous_monotonic is not None:
-            elapsed = loop_started - previous_monotonic
+        if sample_valid and previous_monotonic is not None:
+            elapsed = metrics_scraped_at - previous_monotonic
 
         rates = {
             "begin_dir": None,
@@ -649,35 +691,6 @@ def main():
 
                 if reset:
                     counter_reset = 1
-
-        tor_cpu_pct = None
-        tor_main_cpu_pct = None
-
-        if (
-            elapsed
-            and proc_ticks is not None
-            and previous_proc_ticks is not None
-            and proc_ticks >= previous_proc_ticks
-        ):
-            tor_cpu_pct = (
-                (proc_ticks - previous_proc_ticks)
-                / clk_tck
-                / elapsed
-                * 100.0
-            )
-
-        if (
-            elapsed
-            and main_ticks is not None
-            and previous_main_ticks is not None
-            and main_ticks >= previous_main_ticks
-        ):
-            tor_main_cpu_pct = (
-                (main_ticks - previous_main_ticks)
-                / clk_tck
-                / elapsed
-                * 100.0
-            )
 
         read_mbps = (
             rates["read_bytes"] / 1_000_000
@@ -866,18 +879,13 @@ def main():
 
         append_csv(now, row)
 
-        # Update baselines only from a valid scrape.
+        # Metrics counter baseline advances only on valid scrapes.
+        # CPU baseline is independent and was updated by CpuTracker above.
         if sample_valid:
             previous = current
-            previous_monotonic = loop_started
+            previous_monotonic = metrics_scraped_at
 
-        previous_pid = pid
-
-        if proc_ticks is not None:
-            previous_proc_ticks = proc_ticks
-
-        if main_ticks is not None:
-            previous_main_ticks = main_ticks
+        previous_process = current_process
 
         interval = (
             FAST_INTERVAL
